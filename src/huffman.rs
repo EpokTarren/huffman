@@ -1,5 +1,60 @@
 use bit_vec::BitVec;
-use std::{collections::BinaryHeap, rc::Rc};
+use std::collections::{BinaryHeap, HashMap};
+
+pub trait Alphabet: Sized + Eq + std::hash::Hash {
+    type Map: IntoIterator<Item = (Self, usize)>;
+
+    fn init_map() -> Self::Map;
+    fn increment_map(&self, map: &mut Self::Map);
+    fn from_bits(it: &mut impl Iterator<Item = bool>) -> Option<Self>;
+    fn write(&self, bits: &mut BitVec);
+}
+
+impl Alphabet for u8 {
+    type Map = [(u8, usize); 256];
+
+    fn init_map() -> Self::Map {
+        [(0, 0); 256]
+    }
+
+    fn increment_map(&self, map: &mut Self::Map) {
+        map[*self as usize].0 = *self;
+        map[*self as usize].1 += 1;
+    }
+
+    fn from_bits(it: &mut impl Iterator<Item = bool>) -> Option<Self> {
+        read_byte(it)
+    }
+
+    fn write(&self, bits: &mut BitVec) {
+        bits.extend(BitVec::from_bytes(&[*self]))
+    }
+}
+
+impl<const N: usize> Alphabet for [u8; N] {
+    type Map = HashMap<Self, usize>;
+
+    fn init_map() -> Self::Map {
+        Self::Map::new()
+    }
+
+    fn increment_map(&self, map: &mut Self::Map) {
+        map.entry(*self).and_modify(|c| *c += 1).or_insert(1);
+    }
+
+    fn from_bits(it: &mut impl Iterator<Item = bool>) -> Option<Self> {
+        let mut res = [0; N];
+        for b in res.iter_mut() {
+            *b = read_byte(it)?;
+        }
+
+        return Some(res);
+    }
+
+    fn write(&self, bits: &mut BitVec) {
+        bits.extend(BitVec::from_bytes(self))
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Tree<T> {
@@ -34,7 +89,7 @@ enum Direction {
 #[derive(Debug, Clone)]
 enum DirectionNode {
     Leaf,
-    Node(usize, Direction, Rc<Self>),
+    Node(usize, Direction, Box<Self>),
 }
 
 impl Iterator for DirectionNode {
@@ -66,35 +121,29 @@ impl ExactSizeIterator for DirectionNode {
     }
 }
 
-fn table_recursive(tree: &Tree<u8>) -> [Option<Rc<DirectionNode>>; 256] {
+fn table_recursive<A: Alphabet + Clone>(tree: &Tree<A>) -> HashMap<A, Box<DirectionNode>> {
     match &tree.inner {
         TreeInner::Leaf(n) => {
-            const INIT: Option<Rc<DirectionNode>> = None;
-            let mut directions = [INIT; 256];
-            directions[*n as usize] = Some(Rc::new(DirectionNode::Leaf));
-            directions
+            let mut directions = HashMap::new();
+            directions.insert(n.clone(), Box::new(DirectionNode::Leaf));
+            return directions;
         }
 
         TreeInner::Node(left, right) => {
             let mut left = table_recursive(&left);
             let right = table_recursive(&right);
 
-            for xs in left.iter_mut() {
-                if let Some(xs) = xs {
-                    *xs = Rc::new(DirectionNode::Node(
-                        xs.len() + 1,
-                        Direction::Left,
-                        xs.clone(),
-                    ));
-                }
+            for (_, xs) in left.iter_mut() {
+                *xs = Box::new(DirectionNode::Node(
+                    xs.len() + 1,
+                    Direction::Left,
+                    xs.clone(),
+                ));
             }
 
-            for (i, xs) in right
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, xs)| xs.map(|xs| (i, xs)))
-            {
-                left[i] = Some(Rc::new(DirectionNode::Node(xs.len(), Direction::Right, xs)));
+            for (n, xs) in right.into_iter() {
+                let direction = Box::new(DirectionNode::Node(xs.len() + 1, Direction::Right, xs));
+                left.insert(n, direction);
             }
 
             left
@@ -102,33 +151,25 @@ fn table_recursive(tree: &Tree<u8>) -> [Option<Rc<DirectionNode>>; 256] {
     }
 }
 
-fn table(tree: &Tree<u8>) -> [Vec<Direction>; 256] {
-    const INIT: Vec<Direction> = Vec::new();
-    let mut directions = [INIT; 256];
-    let direction_lists = table_recursive(tree);
-
-    for (dst, src) in directions.iter_mut().zip(direction_lists.into_iter()) {
-        if let Some(xs) = src {
-            *dst = (*xs).clone().collect();
-        }
-    }
-
-    directions
+fn table<A: Alphabet + Clone>(tree: &Tree<A>) -> HashMap<A, Vec<Direction>> {
+    table_recursive(tree)
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect()
 }
 
-pub fn tree(buf: &[u8]) -> Tree<u8> {
-    let mut frequencies = [0usize; 256];
-    for &b in buf {
-        frequencies[b as usize] += 1;
+pub fn tree<A: Alphabet>(buf: &[A]) -> Tree<A> {
+    let mut frequencies = A::init_map();
+    for b in buf {
+        b.increment_map(&mut frequencies);
     }
 
     let mut frequencies = frequencies
-        .iter()
-        .enumerate()
-        .filter(|(_, &freq)| freq != 0)
-        .map(|(i, &freq)| Tree {
+        .into_iter()
+        .filter(|(_, freq)| *freq != 0)
+        .map(|(ch, freq)| Tree {
             freq,
-            inner: TreeInner::Leaf(i as u8),
+            inner: TreeInner::Leaf(ch),
         })
         .collect::<BinaryHeap<_>>();
 
@@ -142,23 +183,17 @@ pub fn tree(buf: &[u8]) -> Tree<u8> {
                 });
             }
             (Some(tree), None) => return tree,
-            (None, None) => {
-                return Tree {
-                    freq: 0,
-                    inner: TreeInner::Leaf(0),
-                }
-            }
-            (None, Some(_)) => unreachable!(),
+            (None, None) | (None, Some(_)) => unreachable!(),
         }
     }
 }
 
-impl Tree<u8> {
+impl<A: Alphabet> Tree<A> {
     fn encode(&self, w: &mut BitVec) {
         match &self.inner {
             TreeInner::Leaf(b) => {
                 w.push(true);
-                w.append(&mut BitVec::from_bytes(&[*b]));
+                A::write(b, w);
             }
 
             TreeInner::Node(left, right) => {
@@ -170,9 +205,9 @@ impl Tree<u8> {
     }
 }
 
-pub fn encode_tree(
-    buf: &[u8],
-    tree: &Tree<u8>,
+pub fn encode_tree<A: Alphabet + Clone>(
+    buf: &[A],
+    tree: &Tree<A>,
     output: &mut impl std::io::Write,
 ) -> std::io::Result<usize> {
     assert!(!buf.is_empty(), "Buffer must be non empty");
@@ -182,29 +217,32 @@ pub fn encode_tree(
     tree.encode(&mut w);
 
     buf.iter()
-        .flat_map(|&b| table[b as usize].iter())
+        .flat_map(|b| table.get(b).unwrap())
         .for_each(|d| w.push(*d != Direction::Left));
 
     output.write_all(&w.to_bytes()).map(|_| 0)
 }
 
-pub fn encode(buf: &[u8], output: &mut impl std::io::Write) -> std::io::Result<usize> {
+pub fn encode<A: Alphabet + Clone>(
+    buf: &[A],
+    output: &mut impl std::io::Write,
+) -> std::io::Result<usize> {
     assert!(!buf.is_empty(), "Buffer must be non empty");
 
     let tree = tree(buf);
     encode_tree(buf, &tree, output)
 }
 
-fn read_byte<R: Iterator<Item = bool>>(r: &mut R) -> Option<u8> {
+pub fn read_byte<R: Iterator<Item = bool>>(r: &mut R) -> Option<u8> {
     (0..8).try_fold(0, |acc, _| r.next().map(|n| (acc << 1) | n as u8))
 }
 
-impl Tree<u8> {
+impl<A: Alphabet + Clone> Tree<A> {
     fn decode<R: Iterator<Item = bool>>(r: &mut R) -> Self {
         if r.next().unwrap() == true {
             Self {
                 freq: 0,
-                inner: TreeInner::Leaf(read_byte(r).unwrap()),
+                inner: TreeInner::Leaf(A::from_bits(r).unwrap()),
             }
         } else {
             Self {
@@ -214,11 +252,11 @@ impl Tree<u8> {
         }
     }
 
-    fn decode_byte<R: Iterator<Item = bool>>(&self, r: &mut R) -> u8 {
+    fn decode_byte<R: Iterator<Item = bool>>(&self, r: &mut R) -> A {
         let mut tree = self;
         loop {
             match &tree.inner {
-                TreeInner::Leaf(b) => return *b,
+                TreeInner::Leaf(b) => return b.clone(),
                 TreeInner::Node(left, right) => {
                     tree = if matches!(r.next(), Some(false)) {
                         left
@@ -231,7 +269,7 @@ impl Tree<u8> {
     }
 }
 
-pub fn decode(r: &[u8]) -> Vec<u8> {
+pub fn decode<A: Alphabet + Clone>(r: &[u8]) -> Vec<A> {
     assert!(r.len() >= 10, "Must fit header information");
 
     let len = usize::from_le_bytes(r[..8].try_into().expect("slice to have length at least 10"));
